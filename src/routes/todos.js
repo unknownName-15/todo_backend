@@ -6,7 +6,6 @@ const { google } = require('googleapis');
 const router = express.Router();
 router.use(authMiddleware);
 
-// Google OAuth 클라이언트 생성
 const getOAuthClient = async (userId) => {
   const result = await pool.query(
     'SELECT google_access_token, google_refresh_token FROM users WHERE id=$1',
@@ -50,26 +49,80 @@ router.get('/', async (req, res, next) => {
   }
 });
 
-// POST /todos — 할일 추가 + 구글 캘린더 등록
+// POST /todos/from-calendar
+router.post('/from-calendar', async (req, res, next) => {
+  try {
+    const { content, due_date, calendar_event_id } = req.body;
+
+    const exists = await pool.query(
+      'SELECT * FROM todos WHERE calendar_event_id=$1 AND user_id=$2',
+      [calendar_event_id, req.userId]
+    );
+
+    let todo;
+    if (exists.rows.length > 0) {
+      todo = exists.rows[0];
+    } else {
+      const result = await pool.query(
+        'INSERT INTO todos (user_id, content, due_date, calendar_event_id) VALUES ($1, $2, $3, $4) RETURNING *',
+        [req.userId, content, due_date || null, calendar_event_id]
+      );
+      todo = result.rows[0];
+    }
+
+    const updated = await pool.query(
+      'UPDATE todos SET is_done = NOT is_done WHERE id=$1 AND user_id=$2 RETURNING *',
+      [todo.id, req.userId]
+    );
+
+    try {
+      const auth     = await getOAuthClient(req.userId);
+      const calendar = google.calendar({ version: 'v3', auth });
+      await calendar.events.patch({
+        calendarId: 'primary',
+        eventId: calendar_event_id,
+        requestBody: {
+          summary: updated.rows[0].is_done ? `✅ ${content}` : content,
+        },
+      });
+    } catch (e) {
+      console.error('캘린더 완료 표시 실패:', e.message);
+    }
+
+    res.json(updated.rows[0]);
+  } catch (e) {
+    next(e);
+  }
+});
+
+// POST /todos
 router.post('/', async (req, res, next) => {
   try {
-    const { content, priority = 'none', due_date = null } = req.body;
+    const { content, priority = 'none', due_date = null, start_time = null, end_time = null } = req.body;
     if (!content) return res.status(400).json({ message: '내용을 입력해 주세요.' });
 
     let calendar_event_id = null;
 
-    // due_date 있으면 구글 캘린더에 자동 등록
     if (due_date) {
       try {
         const auth     = await getOAuthClient(req.userId);
         const calendar = google.calendar({ version: 'v3', auth });
 
+        const startDateTime = start_time
+          ? { dateTime: `${due_date}T${start_time}:00`, timeZone: 'Asia/Seoul' }
+          : { date: due_date };
+        const endDateTime = end_time
+          ? { dateTime: `${due_date}T${end_time}:00`, timeZone: 'Asia/Seoul' }
+          : start_time
+          ? { dateTime: `${due_date}T${start_time}:00`, timeZone: 'Asia/Seoul' }
+          : { date: due_date };
+
         const event = await calendar.events.insert({
           calendarId: 'primary',
           requestBody: {
             summary: content,
-            start: { date: due_date },
-            end:   { date: due_date },
+            start: startDateTime,
+            end: endDateTime,
             description: `FOCUS 할일 | 중요도: ${priority}`,
           },
         });
@@ -80,8 +133,8 @@ router.post('/', async (req, res, next) => {
     }
 
     const result = await pool.query(
-      'INSERT INTO todos (user_id, content, priority, due_date, calendar_event_id) VALUES ($1, $2, $3, $4, $5) RETURNING *',
-      [req.userId, content, priority, due_date, calendar_event_id]
+      'INSERT INTO todos (user_id, content, priority, due_date, start_time, end_time, calendar_event_id) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *',
+      [req.userId, content, priority, due_date, start_time, end_time, calendar_event_id]
     );
     res.status(201).json(result.rows[0]);
   } catch (e) {
@@ -89,7 +142,7 @@ router.post('/', async (req, res, next) => {
   }
 });
 
-// PUT /todos/:id — 완료 토글 + 구글 캘린더 완료 표시
+// PUT /todos/:id
 router.put('/:id', async (req, res, next) => {
   try {
     const { id } = req.params;
@@ -102,12 +155,10 @@ router.put('/:id', async (req, res, next) => {
 
     const todo = result.rows[0];
 
-    // 구글 캘린더 일정이 연동된 경우 완료 표시
     if (todo.calendar_event_id) {
       try {
         const auth     = await getOAuthClient(req.userId);
         const calendar = google.calendar({ version: 'v3', auth });
-
         await calendar.events.patch({
           calendarId: 'primary',
           eventId: todo.calendar_event_id,
@@ -126,7 +177,7 @@ router.put('/:id', async (req, res, next) => {
   }
 });
 
-// PATCH /todos/:id/priority — 중요도 변경
+// PATCH /todos/:id/priority
 router.patch('/:id/priority', async (req, res, next) => {
   try {
     const { id } = req.params;
@@ -143,11 +194,11 @@ router.patch('/:id/priority', async (req, res, next) => {
   }
 });
 
-// PATCH /todos/:id — 내용 수정
+// PATCH /todos/:id
 router.patch('/:id', async (req, res, next) => {
   try {
     const { id } = req.params;
-    const { content, due_date } = req.body;
+    const { content, due_date, start_time = null, end_time = null } = req.body;
     if (!content) return res.status(400).json({ message: '내용을 입력해 주세요.' });
 
     const existing = await pool.query(
@@ -164,24 +215,29 @@ router.patch('/:id', async (req, res, next) => {
       const auth     = await getOAuthClient(req.userId);
       const calendar = google.calendar({ version: 'v3', auth });
 
+      const startDateTime = start_time && due_date
+        ? { dateTime: `${due_date}T${start_time}:00`, timeZone: 'Asia/Seoul' }
+        : due_date ? { date: due_date } : undefined;
+      const endDateTime = end_time && due_date
+        ? { dateTime: `${due_date}T${end_time}:00`, timeZone: 'Asia/Seoul' }
+        : startDateTime;
+
       if (calendar_event_id) {
-        // 기존 캘린더 일정 수정
         await calendar.events.patch({
           calendarId: 'primary',
           eventId: calendar_event_id,
           requestBody: {
             summary: content,
-            ...(due_date && { start: { date: due_date }, end: { date: due_date } }),
+            ...(startDateTime && { start: startDateTime, end: endDateTime }),
           },
         });
       } else if (due_date) {
-        // 새로 캘린더 등록
         const event = await calendar.events.insert({
           calendarId: 'primary',
           requestBody: {
             summary: content,
-            start: { date: due_date },
-            end:   { date: due_date },
+            start: startDateTime,
+            end: endDateTime || startDateTime,
           },
         });
         calendar_event_id = event.data.id;
@@ -191,8 +247,8 @@ router.patch('/:id', async (req, res, next) => {
     }
 
     const result = await pool.query(
-      `UPDATE todos SET content=$1, due_date=$2, calendar_event_id=$3 WHERE id=$4 AND user_id=$5 RETURNING *`,
-      [content, due_date ?? null, calendar_event_id, id, req.userId]
+      `UPDATE todos SET content=$1, due_date=$2, start_time=$3, end_time=$4, calendar_event_id=$5 WHERE id=$6 AND user_id=$7 RETURNING *`,
+      [content, due_date ?? null, start_time, end_time, calendar_event_id, id, req.userId]
     );
     res.json(result.rows[0]);
   } catch (e) {
@@ -200,7 +256,7 @@ router.patch('/:id', async (req, res, next) => {
   }
 });
 
-// DELETE /todos/:id — 할일 삭제 + 캘린더 일정도 삭제
+// DELETE /todos/:id
 router.delete('/:id', async (req, res, next) => {
   try {
     const { id } = req.params;
@@ -213,7 +269,6 @@ router.delete('/:id', async (req, res, next) => {
 
     const todo = existing.rows[0];
 
-    // 연동된 캘린더 일정도 삭제
     if (todo.calendar_event_id) {
       try {
         const auth     = await getOAuthClient(req.userId);
@@ -229,56 +284,6 @@ router.delete('/:id', async (req, res, next) => {
 
     await pool.query('DELETE FROM todos WHERE id=$1 AND user_id=$2', [id, req.userId]);
     res.json({ message: '삭제 완료' });
-  } catch (e) {
-    next(e);
-  }
-});
-
-// POST /todos/from-calendar — 캘린더 일정을 할일로 저장 후 완료 처리
-router.post('/from-calendar', async (req, res, next) => {
-  try {
-    const { content, due_date, calendar_event_id } = req.body;
-
-    // 이미 저장된 할일인지 확인
-    const exists = await pool.query(
-      'SELECT * FROM todos WHERE calendar_event_id=$1 AND user_id=$2',
-      [calendar_event_id, req.userId]
-    );
-
-    let todo;
-    if (exists.rows.length > 0) {
-      todo = exists.rows[0];
-    } else {
-      // 새로 할일로 저장
-      const result = await pool.query(
-        'INSERT INTO todos (user_id, content, due_date, calendar_event_id) VALUES ($1, $2, $3, $4) RETURNING *',
-        [req.userId, content, due_date || null, calendar_event_id]
-      );
-      todo = result.rows[0];
-    }
-
-    // 완료 토글
-    const updated = await pool.query(
-      'UPDATE todos SET is_done = NOT is_done WHERE id=$1 AND user_id=$2 RETURNING *',
-      [todo.id, req.userId]
-    );
-
-    // 구글 캘린더에도 완료 표시
-    try {
-      const auth     = await getOAuthClient(req.userId);
-      const calendar = google.calendar({ version: 'v3', auth });
-      await calendar.events.patch({
-        calendarId: 'primary',
-        eventId: calendar_event_id,
-        requestBody: {
-          summary: updated.rows[0].is_done ? `✅ ${content}` : content,
-        },
-      });
-    } catch (e) {
-      console.error('캘린더 완료 표시 실패:', e.message);
-    }
-
-    res.json(updated.rows[0]);
   } catch (e) {
     next(e);
   }
